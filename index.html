@@ -1873,8 +1873,9 @@ function loadPeer() {
     const next = () => {
       if (i >= urls.length) { peerLoad = null; return reject(new Error('Die Online-Bibliothek (PeerJS) konnte nicht geladen werden. Bist du online?')); }
       const s = document.createElement('script'); s.src = urls[i++]; s.async = true;
-      s.onload = () => { const P = window.Peer || (window.peerjs && window.peerjs.Peer); if (P) resolve(P); else next(); };
-      s.onerror = () => { s.remove(); next(); };
+      const t = setTimeout(() => { s.onload = s.onerror = null; s.remove(); next(); }, 8000);
+      s.onload = () => { clearTimeout(t); const P = window.Peer || (window.peerjs && window.peerjs.Peer); if (P) resolve(P); else next(); };
+      s.onerror = () => { clearTimeout(t); s.remove(); next(); };
       document.head.appendChild(s);
     };
     next();
@@ -1919,6 +1920,7 @@ class PeerClientNet {
   async connect(code) {
     this.code = code;
     const Peer = await loadPeer();
+    if (this.closed) return;
     await new Promise((resolve, reject) => {
       const peer = new Peer({ debug: 0 }); this.peer = peer; let opened = false;
       const timer = setTimeout(() => { if (!opened) reject({ type: 'network', message: 'Keine Verbindung zum Vermittlungsserver.' }); }, 15000);
@@ -1934,7 +1936,7 @@ class PeerClientNet {
     try { if (old) old.close(); } catch (e) { /* egal */ }
     const conn = this.peer.connect(PEER_PREFIX + this.code.toLowerCase(), { reliable: true, serialization: 'json' });
     this.conn = conn;
-    const openT = setTimeout(() => { if (!conn.open) this.retry(); }, 9000);
+    const openT = setTimeout(() => { if (!conn.open) this.retry(); }, 14000);
     conn.on('open', () => { clearTimeout(openT); this.h.status('open'); this.h.open(); });
     conn.on('data', d => this.h.message(d));
     conn.on('close', () => { if (this.conn === conn) { this.h.status('reconnecting'); this.retry(); } });
@@ -1954,6 +1956,211 @@ class PeerClientNet {
   }
   send(msg) { if (this.conn && this.conn.open) { try { this.conn.send(msg); return true; } catch (e) { /* egal */ } } return false; }
   close() { this.closed = true; clearTimeout(this.rt); try { this.peer && this.peer.destroy(); } catch (e) { /* egal */ } }
+}
+
+// --- Ausweichroute (MQTT über WebSocket, öffentliche Dienste), wenn keine Direktverbindung zustande kommt ---
+const RELAY_BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker-cn.emqx.io:8084/mqtt'];
+const NET_FORCE = new URLSearchParams(location.search).get('net'); // ?net=relay zum Testen
+const relayBytes = s => new TextEncoder().encode(s);
+async function relayKeys(code) {
+  if (!window.crypto || !crypto.subtle) throw { type: 'network', message: 'Dieser Browser kann die Ausweichroute nicht verschlüsseln.' };
+  const c = code.toUpperCase();
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', relayBytes('ddf-dfr:' + c)));
+  const hex = Array.from(hash.slice(0, 16), b => b.toString(16).padStart(2, '0')).join('');
+  const base = await crypto.subtle.importKey('raw', relayBytes(c), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: relayBytes('ddf-dfr-relay'), iterations: 50000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  return { topic: 'ddf-dfr/' + hex, key };
+}
+async function relaySeal(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, relayBytes(JSON.stringify(obj))));
+  const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12);
+  return out;
+}
+async function relayOpen(key, b) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b.slice(0, 12) }, key, b.slice(12));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+function mqttStr(s) { const b = relayBytes(s), o = new Uint8Array(b.length + 2); o[0] = b.length >> 8; o[1] = b.length & 255; o.set(b, 2); return o; }
+function mqttPacket(head, ...parts) {
+  let n = parts.reduce((a, p) => a + p.length, 0); const len = [];
+  do { let d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; len.push(d); } while (n > 0);
+  const total = parts.reduce((a, p) => a + p.length, 1 + len.length), o = new Uint8Array(total);
+  o[0] = head; o.set(len, 1); let at = 1 + len.length;
+  parts.forEach(p => { o.set(p, at); at += p.length; });
+  return o;
+}
+// Kleiner MQTT-3.1.1-Client: QoS 0, ein Abo, verbindet sich bei Abbruch neu
+class MqttLink {
+  constructor(url, topic, on) { this.url = url; this.topic = topic; this.on = on; this.up = false; this.closed = false; this.buf = new Uint8Array(0); }
+  open() {
+    if (this.closed) return;
+    this.buf = new Uint8Array(0);
+    let ws; try { ws = new WebSocket(this.url, 'mqtt'); } catch (e) { return this.lost(); }
+    ws.binaryType = 'arraybuffer'; this.ws = ws;
+    this.openT = setTimeout(() => { try { ws.close(); } catch (e) { /* egal */ } }, 8000);
+    ws.onopen = () => ws.send(mqttPacket(0x10, mqttStr('MQTT'), [4, 2, 0, 60], mqttStr('ddf-' + uid(14))));
+    ws.onmessage = e => { if (this.ws === ws) this.feed(new Uint8Array(e.data)); };
+    ws.onclose = () => { if (this.ws === ws) this.lost(); };
+    ws.onerror = () => { /* close folgt */ };
+  }
+  lost() {
+    clearTimeout(this.openT); clearInterval(this.pingI); this.ws = null;
+    const was = this.up; this.up = false;
+    if (this.closed) return;
+    if (was) { if (this.on.down) this.on.down(); } else if (this.on.fail) this.on.fail();
+    if (!this.closed) this.retryT = setTimeout(() => this.open(), 2500);
+  }
+  feed(chunk) {
+    const b = new Uint8Array(this.buf.length + chunk.length); b.set(this.buf); b.set(chunk, this.buf.length);
+    let at = 0;
+    for (;;) {
+      let mul = 1, n = 0, i = at + 1, more = true;
+      while (more && i < b.length) { n += (b[i] & 127) * mul; mul *= 128; more = !!(b[i] & 128); i++; }
+      if (more || i + n > b.length) break;
+      this.packet(b[at], b.subarray(i, i + n)); at = i + n;
+    }
+    this.buf = b.slice(at);
+  }
+  packet(head, body) {
+    const type = head >> 4;
+    if (type === 2) {
+      if (body[1] !== 0) { try { this.ws.close(); } catch (e) { /* egal */ } return; }
+      this.ws.send(mqttPacket(0x82, [0, 1], mqttStr(this.topic), [0]));
+    } else if (type === 9) {
+      clearTimeout(this.openT); this.up = true;
+      this.pingI = setInterval(() => { try { this.ws && this.ws.send(new Uint8Array([0xC0, 0])); } catch (e) { /* egal */ } }, 25000);
+      if (this.on.up) this.on.up();
+    } else if (type === 3) {
+      const tl = (body[0] << 8) | body[1];
+      if (this.on.msg) this.on.msg(body.slice(2 + tl));
+    }
+  }
+  pub(topic, bytes) { if (!this.up || !this.ws) return false; try { this.ws.send(mqttPacket(0x30, mqttStr(topic), bytes)); return true; } catch (e) { return false; } }
+  close() { this.closed = true; this.up = false; clearTimeout(this.openT); clearTimeout(this.retryT); clearInterval(this.pingI); const ws = this.ws; this.ws = null; try { ws && ws.close(); } catch (e) { /* egal */ } }
+}
+class RelayHostNet {
+  constructor(hd) { this.h = hd; this.links = []; this.route = new Map(); this.pending = new Map(); this.q = Promise.resolve(); }
+  async start(code) {
+    this.keys = await relayKeys(code);
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const timer = setTimeout(() => { if (!done) { done = true; reject({ type: 'network', message: 'Keine Verbindung zum Ausweich-Dienst.' }); } }, 10000);
+      RELAY_BROKERS.forEach(url => {
+        const link = new MqttLink(url, this.keys.topic + '/h', {
+          msg: b => this.recv(link, b),
+          up: () => { this.h.status('online'); if (!done) { done = true; clearTimeout(timer); resolve(code); } },
+          down: () => { if (!this.links.some(l => l.up)) this.h.status('reconnecting'); }
+        });
+        this.links.push(link); link.open();
+      });
+    });
+  }
+  recv(link, b) {
+    relayOpen(this.keys.key, b).then(d => {
+      if (!d || !d.c) return;
+      const id = 'r:' + d.c; this.route.set(id, link); this.h.message(id, d.m);
+    }).catch(() => { /* fremde Nachricht */ });
+  }
+  send(id, msg) {
+    if (msg.t !== 'state') return this.out(id, msg);
+    // Zustände zusammenfassen, nur der neueste zählt
+    this.pending.set(id, msg);
+    if (!this.ft) this.ft = setTimeout(() => { this.ft = null; const items = Array.from(this.pending); this.pending.clear(); items.forEach(([i, m]) => this.out(i, m)); }, 120);
+  }
+  out(id, msg) {
+    const link = this.route.get(id); if (!link) return;
+    const topic = this.keys.topic + '/c/' + id.slice(2);
+    this.q = this.q.then(() => relaySeal(this.keys.key, msg)).then(b => { link.pub(topic, b); }).catch(() => { /* egal */ });
+  }
+  close() { clearTimeout(this.ft); this.links.forEach(l => l.close()); this.links = []; }
+}
+class RelayClientNet {
+  constructor(hd) { this.h = hd; this.cid = uid(12); this.closed = false; this.i = -1; this.tried = 0; this.ups = 0; this.heard = false; this.q = Promise.resolve(); }
+  async connect(code) { this.keys = await relayKeys(code); this.next(); }
+  next() {
+    if (this.closed) return;
+    this.clearT();
+    if (this.link) this.link.close();
+    if (this.tried >= RELAY_BROKERS.length) {
+      if (!this.ups) { this.close(); this.h.status('error', { type: 'network', message: 'Keine Verbindung zum Online-Dienst. Bist du online?' }); return; }
+      this.h.status('nohost'); this.tried = 0; this.ups = 0;
+    }
+    this.tried++; this.i = (this.i + 1) % RELAY_BROKERS.length; this.heard = false;
+    const link = new MqttLink(RELAY_BROKERS[this.i], this.keys.topic + '/c/' + this.cid, {
+      msg: b => this.recv(b),
+      up: () => this.linkUp(),
+      down: () => { if (this.heard) this.h.status('reconnecting'); },
+      fail: () => { if (!this.heard && this.link === link) this.next(); }
+    });
+    this.link = link; link.open();
+  }
+  linkUp() {
+    this.ups++; this.h.open();
+    if (this.heard) return;
+    this.helloI = setInterval(() => { if (!this.heard) this.h.open(); }, 2500);
+    this.switchT = setTimeout(() => { if (!this.heard) this.next(); }, 9000);
+  }
+  recv(b) {
+    relayOpen(this.keys.key, b).then(m => { this.heard = true; this.clearT(); this.h.message(m); }).catch(() => { /* fremde Nachricht */ });
+  }
+  clearT() { clearInterval(this.helloI); clearTimeout(this.switchT); }
+  send(msg) {
+    const link = this.link; if (!link || !link.up) return false;
+    this.q = this.q.then(() => relaySeal(this.keys.key, { c: this.cid, m: msg })).then(b => { link.pub(this.keys.topic + '/h', b); }).catch(() => { /* egal */ });
+    return true;
+  }
+  close() { this.closed = true; this.clearT(); if (this.link) this.link.close(); }
+}
+// Erst direkt per WebRTC, sonst automatisch über die Ausweichroute
+class HybridHostNet {
+  constructor(hd) {
+    this.h = hd; this.up = {};
+    const wrap = kind => ({ message: (id, m) => hd.message(id, m), disconnect: id => hd.disconnect(id), status: (s, err) => this.st(kind, s, err) });
+    this.peer = new PeerHostNet(wrap('peer')); this.relay = new RelayHostNet(wrap('relay'));
+  }
+  st(kind, s, err) { this.up[kind] = s === 'online'; if (!this.ready) return; if (this.up.peer || this.up.relay) this.h.status('online'); else this.h.status(s, err); }
+  async start(code) {
+    const direct = NET_FORCE === 'relay' ? Promise.reject({ type: 'network' }) : this.peer.start(code);
+    const [p, r] = await Promise.allSettled([direct, this.relay.start(code)]);
+    const taken = p.status === 'rejected' && p.reason && p.reason.type === 'unavailable-id';
+    if (taken || (p.status === 'rejected' && r.status === 'rejected')) { this.close(); throw p.reason; }
+    this.ready = true;
+    return code;
+  }
+  send(id, msg) { if (id.startsWith('r:')) this.relay.send(id, msg); else this.peer.send(id, msg); }
+  close() { this.peer.close(); this.relay.close(); }
+}
+class HybridClientNet {
+  constructor(hd) { this.h = hd; this.active = null; this.closed = false; }
+  connect(code) {
+    this.code = code;
+    if (NET_FORCE === 'relay') return this.toRelay();
+    this.active = 'peer';
+    this.peer = new PeerClientNet({
+      open: () => { if (this.active === 'peer') this.h.open(); },
+      message: m => this.h.message(m),
+      status: (s, err) => {
+        if (this.active !== 'peer') return;
+        if (s === 'nohost') return this.toRelay();
+        if (s === 'open') { clearTimeout(this.fallT); this.fallT = null; } else this.arm();
+        this.h.status(s, err);
+      }
+    });
+    this.arm();
+    this.peer.connect(code).catch(() => this.toRelay());
+    return Promise.resolve();
+  }
+  arm() { if (!this.fallT) this.fallT = setTimeout(() => this.toRelay(), 10000); }
+  async toRelay() {
+    if (this.closed || this.active === 'relay') return;
+    this.active = 'relay'; clearTimeout(this.fallT);
+    if (this.peer) this.peer.close();
+    this.relay = new RelayClientNet(this.h);
+    try { await this.relay.connect(this.code); } catch (e) { this.h.status('error', e); }
+  }
+  send(msg) { const n = this.active === 'relay' ? this.relay : this.peer; return n ? n.send(msg) : false; }
+  close() { this.closed = true; clearTimeout(this.fallT); if (this.peer) this.peer.close(); if (this.relay) this.relay.close(); }
 }
 
 // --- Eigener Server (server.js im LAN / Heimserver): SSE + POST ---
@@ -2050,7 +2257,7 @@ class HostCtl {
   async goOnline() {
     if (this.net) return true;
     const av = onlineAvailability(); if (!av.ok) { this.netStatus = 'error'; this.netErr = { message: av.why }; this.e.commit(); return false; }
-    const T = av.via === 'server' ? ServerHostNet : PeerHostNet;
+    const T = av.via === 'server' ? ServerHostNet : HybridHostNet;
     const resuming = !!this.e.G.code;
     let code = this.e.G.code || newCode();
     for (let attempt = 0; attempt < 8; attempt++) {
@@ -2092,7 +2299,7 @@ class HostCtl {
   }
   hello(cid, c, m) {
     const e = this.e, G = e.G, name = cleanName(m.name), avatar = AVATARS.includes(m.avatar) ? m.avatar : null;
-    let p = m.pid ? e.player(m.pid) : null;
+    let p = c.pid ? e.player(c.pid) : m.pid ? e.player(m.pid) : null; // Hallo kann mehrfach kommen
     if (!p && name) p = G.players.find(x => x.name.toLowerCase() === name.toLowerCase() && !x.conn) || null;
     if (!p && name && G.phase === 'lobby' && G.players.length < MAX_PLAYERS) p = e.addPlayer({ name, avatar, device: true, silent: true });
     if (p) {
@@ -2133,8 +2340,8 @@ class PlayerCtl {
   async connect() {
     const av = onlineAvailability();
     if (!av.ok) { this.status = 'error'; this.err = { message: av.why }; this.emit(); return; }
-    const T = av.via === 'server' ? ServerClientNet : PeerClientNet;
-    this.net = new T({ open: () => this.hello(), message: m => this.onMsg(m), status: s => { this.status = s; this.emit(); } });
+    const T = av.via === 'server' ? ServerClientNet : HybridClientNet;
+    this.net = new T({ open: () => this.hello(), message: m => this.onMsg(m), status: (s, err) => { this.status = s; if (err) this.err = err; this.emit(); } });
     this.emit();
     try { await this.net.connect(this.code); }
     catch (e) { this.status = 'error'; this.err = e; this.emit(); return; }

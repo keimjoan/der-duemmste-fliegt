@@ -15,7 +15,7 @@ Fan-Nachbau des Quiz-Formats „Der Dümmste fliegt“ (Vorlage: Schmobins Versi
 - Das Moderator-Gerät ist die einzige Wahrheit: `Engine` hält den Zustand `G`, `engine.pub()` erzeugt den öffentlichen Zustand (ohne Antworten, Stimmen, Finale-Antworten vor dem Aufdecken), `engine.me(pid)` die persönlichen Daten.
 - Phasen: `lobby → turn → review → vote (→ tb Stichwahl) → reveal → … → finalIntro → final → end`.
 - Einmal-Effekte laufen über `G.fx` (fortlaufende Nummer `n`), die Bühne spielt sie genau einmal ab.
-- Transporte: `Mirror` (BroadcastChannel, Bühnen-Tab im selben Browser), `PeerHostNet/PeerClientNet` (PeerJS 1.5.4 vom CDN, öffentlicher Dienst peerjs.com), `ServerHostNet/ServerClientNet` (server.js).
+- Transporte: `Mirror` (BroadcastChannel, Bühnen-Tab im selben Browser), `HybridHostNet/HybridClientNet` (erst direkt per `PeerHostNet/PeerClientNet`, PeerJS 1.5.4 vom CDN, öffentlicher Dienst peerjs.com; sonst `RelayHostNet/RelayClientNet`, verschlüsselt über öffentliche MQTT-Dienste, zum Testen mit `?net=relay` erzwingbar), `ServerHostNet/ServerClientNet` (server.js).
 - Im Claude-Artifact sind Verbindungen nach außen gesperrt → dort nur Lokal-Modus (`ENV.inClaude`). Kein `alert/confirm/prompt`, kein `window.open`; `localStorage` nur über `store` (try/catch).
 - Panels werden bei Änderungen neu gezeichnet; `guardPointer` verhindert verlorene Klicks, `data-keep` erhält Eingaben.
 
@@ -34,6 +34,7 @@ node test/local.js                                   # Lokal-Modus, öffnet inde
 PORT=8099 node server.js &  node test/online.js      # Online über server.js, 4 Geräte + Neuladen
 python3 -m http.server 8098 &  node test/peer.js     # Online über PeerJS (mit Nachbildung test/peer-mock.js)
 python3 -m http.server 8098 &  node test/stage.js    # Bühnen-Tab, Nur-Bühne, Tablet-Layout
+node test/relay.js                                   # Ausweichroute über die echten MQTT-Dienste (braucht Internet)
 ```
 Nach Änderungen: bauen, passende Tests laufen lassen, Screenshots ansehen, dann committen. GitHub Pages (falls aktiv) veröffentlicht `index.html` aus `main` automatisch.
 

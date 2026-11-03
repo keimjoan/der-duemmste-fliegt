@@ -14,7 +14,7 @@ Fan-Nachbau des Quiz-Formats (bekannt von PietSmiet, Reved und Schmobin). Alles 
 2. Moderator: **Spiel moderieren → Online mit Code**.
 3. Mitspieler: Seite öffnen → **Spiel beitreten** → Code und Namen eingeben.
 
-Der Verbindungsaufbau läuft über den kostenlosen Dienst von peerjs.com, die Spieldaten gehen direkt zwischen den Browsern hin und her.
+Der Verbindungsaufbau läuft über den kostenlosen Dienst von peerjs.com, die Spieldaten gehen möglichst direkt zwischen den Browsern hin und her. Klappt das nicht (z. B. über mobile Daten), läuft das Spiel automatisch über öffentliche MQTT-Dienste von EMQX weiter. Die Daten werden dabei mit dem Spielcode verschlüsselt; das ist wegen des kurzen Codes nur ein einfacher Schutz, also keine sensiblen Daten als Namen eingeben. Für diese Dienste gibt es keine Verfügbarkeitsgarantie.
 
 **Variante B – Heimnetz oder eigener Server (keine fremden Dienste)**
 ```
