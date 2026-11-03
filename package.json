@@ -1,0 +1,17 @@
+{
+  "name": "der-duemmste-fliegt",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Der Dümmste fliegt – Quiz-Gameshow als Web-App (Moderator-Pult, Bühne, Online-Modus)",
+  "scripts": {
+    "build": "node build.js",
+    "start": "node server.js",
+    "test:local": "node test/local.js",
+    "test:online": "node test/online.js",
+    "test:peer": "node test/peer.js",
+    "test:stage": "node test/stage.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}
