@@ -387,15 +387,15 @@ class Engine {
     const G = this.G; if (G.phase !== 'review') return;
     const cands = this.candidates(), voters = this.voters(), now = Date.now();
     if (!cands.length) {
-      G.reveal = { none: true, counts: {}, tied: [], loser: null, at: now, applied: true };
+      G.reveal = { none: true, counts: {}, tied: [], loser: null, at: now, applied: true, cands: [] };
       G.phase = 'reveal'; this.commit({ type: 'nobody' }); return;
     }
     if (cands.length === 1) {
       const c = cands[0];
-      G.reveal = { counts: { [c]: voters.filter(v => v !== c).length }, tied: [], loser: c, auto: true, at: now, lossAt: now + 1900, applied: false };
+      G.reveal = { counts: { [c]: voters.filter(v => v !== c).length }, tied: [], loser: c, auto: true, at: now, lossAt: now + 1900, applied: false, cands: [c] };
       G.phase = 'reveal'; this.commit({ type: 'reveal', auto: true }); return;
     }
-    G.vote = { cands, voters, open: true, revote: false }; G.votes = {};
+    G.vote = { cands, base: cands.slice(), voters, open: true, revote: false }; G.votes = {};
     G.timer = this.mkTimer(this.s.voteTime); G.phase = 'vote';
     this.commit({ type: 'vote' });
   }
@@ -417,7 +417,7 @@ class Engine {
     Object.keys(G.votes).forEach(voter => { const t = G.votes[voter]; if (t in counts) counts[t]++; });
     const max = Math.max(...Object.values(counts)), top = v.cands.filter(c => counts[c] === max), now = Date.now();
     const loser = max > 0 && top.length === 1 ? top[0] : null;
-    G.reveal = { counts, tied: loser ? [] : top, loser, at: now, lossAt: loser ? now + 1000 + v.cands.length * 330 : null, applied: false, revote: !!v.revote, method: null };
+    G.reveal = { counts, tied: loser ? [] : top, loser, at: now, lossAt: loser ? now + 1000 + v.cands.length * 330 : null, applied: false, revote: !!v.revote, method: null, cands: (v.base || v.cands).slice() };
     G.phase = 'reveal';
     this.commit({ type: 'reveal' });
   }
@@ -430,7 +430,7 @@ class Engine {
     const G = this.G, r = G.reveal; if (G.phase !== 'reveal' || !r || r.loser || !r.tied || r.tied.length < 2 || G.roulette) return;
     if (method === 'revote') {
       const voters = this.voters().filter(id => !r.tied.includes(id)); if (!voters.length || r.revote) return;
-      G.vote = { cands: r.tied.slice(), voters, open: true, revote: true }; G.votes = {};
+      G.vote = { cands: r.tied.slice(), base: (r.cands || r.tied).slice(), voters, open: true, revote: true }; G.votes = {};
       G.timer = this.mkTimer(this.s.voteTime); G.phase = 'tb';
       this.commit({ type: 'revote' });
     } else if (method === 'random') {
@@ -544,6 +544,58 @@ class Engine {
     this.commit();
   }
   toggleJoker(pid) { const p = this.player(pid); if (p) { p.joker = !p.joker; this.commit(); } }
+  // Bewertung einer Frage der laufenden Runde nachträglich ändern (auch noch in Auswertung, Voting, Ergebnis).
+  canFix() { const G = this.G; return ['turn', 'review', 'vote', 'tb', 'reveal'].includes(G.phase) && !G.roulette; }
+  fixTurn(i, result) {
+    const G = this.G, t = G.turns[i];
+    if (!this.canFix() || !t || !t.result) return false;
+    result = result === 'right' ? 'right' : 'wrong';
+    if (t.result === result) return false;
+    t.result = result;
+    const reset = G.phase === 'turn' ? false : this.refreshReview();
+    this.commit({ type: 'fix', pid: t.pid, result, reset });
+    return true;
+  }
+  // Fehlerliste neu aufbauen; ändert sich, wer wählbar ist, wird Voting/Ergebnis zurückgesetzt. Gibt true zurück, wenn neu abgestimmt werden muss.
+  refreshReview() {
+    const G = this.G;
+    G.review = { wrongs: G.turns.filter(t => t.result === 'wrong').map(t => ({ pid: t.pid, q: t.q.q, a: t.q.a, given: t.given, flag: t.q.flag || null })) };
+    if (G.phase === 'review') return false;
+    const now = this.candidates(), same = (a, b) => a.length === b.length && a.every(x => b.includes(x));
+    if (G.phase === 'vote' && G.vote) {
+      const v = G.vote, base = v.base || v.cands;
+      if (same(base, now)) return false;
+      if (now.length >= 2) {
+        v.cands = now.slice(); v.base = now.slice();
+        Object.keys(G.votes).forEach(k => { if (!now.includes(G.votes[k])) delete G.votes[k]; });
+        return false;
+      }
+    } else if (G.phase === 'tb' && G.vote) {
+      if (same(G.vote.base || G.vote.cands, now)) return false;
+    } else if (G.phase === 'reveal' && G.reveal) {
+      if (same(G.reveal.cands || [], now)) return false;
+      this.undoLoss();
+    }
+    Object.assign(G, { phase: 'review', vote: null, votes: {}, reveal: null, timer: null, roulette: null });
+    return true;
+  }
+  undoLoss() {
+    const G = this.G, r = G.reveal, p = r && r.applied && this.player(r.loser); if (!p) return;
+    p.hearts += 1;
+    if (p.out) { if (p.outOrder === G.outCount) G.outCount -= 1; p.out = false; p.outOrder = 0; p.outRound = 0; }
+    const last = G.history[G.history.length - 1];
+    if (last && last.round === G.round && last.loser === p.id) G.history.pop();
+    r.applied = false;
+  }
+  // Finale: Bewertung einer schon gespielten Finalfrage ändern (Punkte werden angepasst).
+  fixFinal(k, pid, ok) {
+    const G = this.G, f = G.final; if (G.phase !== 'final' || !f || f.sd) return false;
+    const hq = f.hist[k]; if (!hq || !(pid in hq.marks)) return false;
+    ok = !!ok; if (!!hq.marks[pid] === ok) return false;
+    hq.marks[pid] = ok; f.score[pid] += ok ? 1 : -1;
+    this.commit({ type: ok ? 'fright' : 'fwrong', pid });
+    return true;
+  }
   pauseTimer() {
     const t = this.G.timer; if (!t || t.expired) return;
     if (t.paused) { t.end = Date.now() + t.left; t.paused = false; } else { t.left = Math.max(0, t.end - Date.now()); t.paused = true; }
@@ -1700,6 +1752,12 @@ class StageView {
       case 'turn': case 'swap': this.snd('turn'); break;
       case 'round': this.snd('turn'); this.banner(`RUNDE ${fx.round}`, S.round === 1 ? 'Jeder bekommt ' + S.s.qpp + (S.s.qpp === 1 ? ' Frage' : ' Fragen') : '', 'gold', 1900); break;
       case 'jokerTo': flash(fx.to, 'flash-right'); break;
+      case 'fix': {
+        const p = P(fx.pid), ok = fx.result === 'right';
+        this.snd(ok ? 'right' : 'wrong'); flash(fx.pid, ok ? 'flash-right' : 'flash-wrong');
+        if (p) this.banner('KORREKTUR', `${p.name}: doch ${ok ? 'richtig' : 'falsch'}` + (fx.reset ? ' – es wird neu abgestimmt' : ''), ok ? 'ok' : '', 2600);
+        break;
+      }
       case 'voted': case 'locked': this.snd('vote'); break;
       case 'reveal': { const n = (S.reveal && Object.keys(S.reveal.counts || {}).length) || 2; for (let i = 0; i < n; i++) setTimeout(() => this.snd('drum'), 250 + i * 330); break; }
       case 'heart': { const p = P(fx.pid); this.snd('heart'); flash(fx.pid, 'shake'); if (p) this.banner(`${p.name.toUpperCase()} −1 HERZ`, `noch ${p.hearts} ${p.hearts === 1 ? 'Herz' : 'Herzen'}`, '', 2900); break; }
@@ -1822,7 +1880,7 @@ class HostPanel {
     const focus = ae && ae.id && this.root.contains(ae) ? { id: ae.id, s: ae.selectionStart, e: ae.selectionEnd } : null;
     const scroll = this.root.scrollTop;
     this.root.textContent = '';
-    appendAll(this.root, [this.head(), this.mainCard(), this.playersCard(), this.settingsCard(), this.help()]);
+    appendAll(this.root, [this.head(), this.mainCard(), this.fixCard(), this.playersCard(), this.settingsCard(), this.help()]);
     Object.keys(keep).forEach(id => { const el = document.getElementById(id); if (el && el.dataset.keep !== undefined) el.value = keep[id]; });
     if (focus) { const el = document.getElementById(focus.id); if (el) { el.focus(); try { if (focus.s != null) el.setSelectionRange(focus.s, focus.e); } catch (x) { /* egal */ } } }
     this.root.scrollTop = scroll;
@@ -1925,6 +1983,37 @@ class HostPanel {
     }
     if (nextP && !t.result) kids.push(h('div', { class: 'small muted' }, 'Danach: ', nextP.avatar, ' ', nextP.name));
     return h('div', { class: 'card stack' }, kids);
+  }
+  // ----- Bewertungen nachträglich korrigieren -----
+  fixCard() {
+    const e = this.e, G = e.G, f = G.final;
+    let items = [], note = '';
+    if (e.canFix()) {
+      items = G.turns.map((t, i) => ({ t, i })).filter(x => x.t.result && !(G.phase === 'turn' && x.i === G.t)).map(({ t, i }) => {
+        const p = this.P(t.pid), ok = t.result === 'right';
+        return h('div', { class: 'fix-item' + (ok ? ' right' : ' wrong') },
+          h('div', { class: 'row' }, this.av(p), h('b', { class: 'grow' }, p ? p.name : '?'),
+            h('span', { class: 'result-chip ' + t.result }, ok ? '✓ Richtig' : '✗ Falsch'),
+            h('button', { class: 'btn small ' + (ok ? 'bad' : 'ok'), id: `fix-${G.round}-${i}`, onclick: () => e.fixTurn(i, ok ? 'wrong' : 'right') }, ok ? 'Doch falsch' : 'Doch richtig')),
+          h('div', { class: 'q' }, t.q.q), h('div', { class: 'a' }, (t.given ? `Antwort: „${t.given}“ · ` : '') + 'Richtig: ' + t.q.a));
+      });
+      if (G.phase !== 'turn' && G.phase !== 'review') note = 'Ändert sich dadurch, wer wählbar ist, wird neu abgestimmt; ein schon abgezogenes Herz gibt es zurück.';
+    } else if (G.phase === 'final' && f && !f.sd) {
+      items = f.hist.map((hq, k) => hq.sd ? null : h('div', { class: 'fix-item' },
+        h('div', { class: 'q' }, `${k + 1}. ${hq.q}`), h('div', { class: 'a' }, 'Richtig: ' + hq.a),
+        Object.keys(hq.marks).map(id => {
+          const p = this.P(id), ok = !!hq.marks[id];
+          return h('div', { class: 'row' }, this.av(p), h('span', { class: 'grow' }, (p ? p.name : '?') + ': „' + (hq.ans[id] || '—') + '“'),
+            h('span', { class: 'result-chip ' + (ok ? 'right' : 'wrong') }, ok ? '✓' : '✗'),
+            h('button', { class: 'btn small ' + (ok ? 'bad' : 'ok'), onclick: () => e.fixFinal(k, id, !ok) }, ok ? 'Doch falsch' : 'Doch richtig'));
+        }))).filter(Boolean);
+    }
+    if (!items.length) return null;
+    const open = !!this.ui.fixOpen;
+    return h('div', { class: 'card stack' },
+      h('button', { class: 'btn small ghost block', 'aria-expanded': String(open), onclick: () => { this.ui.fixOpen = !open; this.render(); } }, (open ? '▾ ' : '▸ ') + `Bewertungen korrigieren (${items.length})`),
+      open ? h('div', { class: 'stack' }, items) : null,
+      open && note ? h('div', { class: 'tiny muted' }, note) : null);
   }
   markFromPanel(res) {
     const G = this.e.G, inp = document.getElementById(`given-${G.round}-${G.t}`);

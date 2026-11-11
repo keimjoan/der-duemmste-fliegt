@@ -31,6 +31,7 @@ npx playwright install chromium    # falls noch kein Chromium da ist
 
 # Tests (spielen echte Partien über die Oberfläche durch, Screenshots in test/shots/)
 node test/local.js                                   # Lokal-Modus, öffnet index.html direkt
+node test/fix.js                                     # nachträgliche Korrektur von Bewertungen
 PORT=8099 node server.js &  node test/online.js      # Online über server.js, 4 Geräte + Neuladen
 python3 -m http.server 8098 &  node test/peer.js     # Online über PeerJS (mit Nachbildung test/peer-mock.js)
 python3 -m http.server 8098 &  node test/stage.js    # Bühnen-Tab, Nur-Bühne, Tablet-Layout
