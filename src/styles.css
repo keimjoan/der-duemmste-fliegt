@@ -174,6 +174,7 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { border-color: var(--neon
 .wrong-item { padding: 8px 10px; border-radius: 10px; background: #0d1538; border-left: 4px solid var(--bad); }
 .wrong-item .q { font-weight: 600; }
 .wrong-item .a { font-size: 14px; color: var(--muted); }
+.fix-section { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 2px; }
 .fix-item { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 10px; background: #0d1538; border-left: 4px solid var(--line, #2a3566); }
 .fix-item.right { border-left-color: var(--ok); }
 .fix-item.wrong { border-left-color: var(--bad); }

@@ -373,9 +373,10 @@ class Engine {
   // ----- Auswertung & Voting -----
   endRound() {
     const G = this.G; G.phase = 'review'; G.timer = null; G.autoNextAt = null; G.roulette = null;
-    G.review = { wrongs: G.turns.filter(t => t.result === 'wrong').map(t => ({ pid: t.pid, q: t.q.q, a: t.q.a, given: t.given, flag: t.q.flag || null })) };
+    G.review = { wrongs: this.wrongs() };
     this.commit({ type: 'roundEnd' });
   }
+  wrongs() { return this.G.turns.map((t, i) => ({ t, i })).filter(x => x.t.result === 'wrong').map(({ t, i }) => ({ i, pid: t.pid, q: t.q.q, a: t.q.a, given: t.given, flag: t.q.flag || null })); }
   candidates() {
     const act = this.active().map(p => p.id);
     if (!this.s.onlyWrong) return act;
@@ -559,7 +560,7 @@ class Engine {
   // Fehlerliste neu aufbauen; ändert sich, wer wählbar ist, wird Voting/Ergebnis zurückgesetzt. Gibt true zurück, wenn neu abgestimmt werden muss.
   refreshReview() {
     const G = this.G;
-    G.review = { wrongs: G.turns.filter(t => t.result === 'wrong').map(t => ({ pid: t.pid, q: t.q.q, a: t.q.a, given: t.given, flag: t.q.flag || null })) };
+    G.review = { wrongs: this.wrongs() };
     if (G.phase === 'review') return false;
     const now = this.candidates(), same = (a, b) => a.length === b.length && a.every(x => b.includes(x));
     if (G.phase === 'vote' && G.vote) {
@@ -1880,7 +1881,9 @@ class HostPanel {
     const focus = ae && ae.id && this.root.contains(ae) ? { id: ae.id, s: ae.selectionStart, e: ae.selectionEnd } : null;
     const scroll = this.root.scrollTop;
     this.root.textContent = '';
-    appendAll(this.root, [this.head(), this.mainCard(), this.fixCard(), this.playersCard(), this.settingsCard(), this.help()]);
+    const main = this.mainCard(), fix = this.fixCard();
+    if (main && fix) main.appendChild(fix);
+    appendAll(this.root, [this.head(), main, this.playersCard(), this.settingsCard(), this.help()]);
     Object.keys(keep).forEach(id => { const el = document.getElementById(id); if (el && el.dataset.keep !== undefined) el.value = keep[id]; });
     if (focus) { const el = document.getElementById(focus.id); if (el) { el.focus(); try { if (focus.s != null) el.setSelectionRange(focus.s, focus.e); } catch (x) { /* egal */ } } }
     this.root.scrollTop = scroll;
@@ -2010,8 +2013,8 @@ class HostPanel {
     }
     if (!items.length) return null;
     const open = !!this.ui.fixOpen;
-    return h('div', { class: 'card stack' },
-      h('button', { class: 'btn small ghost block', 'aria-expanded': String(open), onclick: () => { this.ui.fixOpen = !open; this.render(); } }, (open ? '▾ ' : '▸ ') + `Bewertungen korrigieren (${items.length})`),
+    return h('div', { class: 'stack fix-section' },
+      h('button', { class: 'btn small block', 'aria-expanded': String(open), onclick: () => { this.ui.fixOpen = !open; this.render(); } }, (open ? '▾ ' : '▸ ') + `✎ Bewertungen korrigieren (${items.length})`),
       open ? h('div', { class: 'stack' }, items) : null,
       open && note ? h('div', { class: 'tiny muted' }, note) : null);
   }
@@ -2026,7 +2029,8 @@ class HostPanel {
   }
   wrongList(wrongs) {
     if (!wrongs.length) return h('div', { class: 'small', style: 'color:var(--ok)' }, 'Niemand hatte einen Fehler.');
-    return h('div', { class: 'wronglist' }, wrongs.map(w => { const p = this.P(w.pid); return h('div', { class: 'wrong-item' }, h('div', { class: 'row' }, this.av(p), h('b', null, p ? p.name : '?')), h('div', { class: 'q' }, w.q), h('div', { class: 'a' }, (w.given ? `Antwort: „${w.given}“ · ` : '') + 'Richtig: ' + w.a)); }));
+    const e = this.e;
+    return h('div', { class: 'wronglist' }, wrongs.map(w => { const p = this.P(w.pid); return h('div', { class: 'wrong-item' }, h('div', { class: 'row' }, this.av(p), h('b', { class: 'grow' }, p ? p.name : '?'), typeof w.i === 'number' && e.canFix() ? h('button', { class: 'btn small ok', onclick: () => e.fixTurn(w.i, 'right') }, '✓ Doch richtig') : null), h('div', { class: 'q' }, w.q), h('div', { class: 'a' }, (w.given ? `Antwort: „${w.given}“ · ` : '') + 'Richtig: ' + w.a)); }));
   }
   review() {
     const e = this.e, G = e.G, cands = e.candidates();

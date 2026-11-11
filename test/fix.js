@@ -62,6 +62,7 @@ const check = (name, ok, info) => { console.log((ok ? 'OK   ' : 'FEHL ') + name 
   await E(`window.__ddf.engine.fixTurn(${await T('turnOf', 'Ben', 'wrong')}, 'right')`);
   s = await T('st');
   check('Auswertung nachher: nur Anna', s.phase === 'review' && s.wrongs.join() === 'Anna' && s.cands.join() === 'Anna', s);
+  await page.waitForTimeout(400);
   await page.screenshot({ path: path.join(OUT, 'fix-03-auswertung.png') });
 
   // 3) Voting mit 3 Wählbaren: einer fällt weg, Voting läuft mit 2 weiter, Stimmen für ihn verfallen
