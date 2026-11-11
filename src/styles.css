@@ -311,6 +311,10 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { border-color: var(--neon
 }
 .pc .pc-in { position: absolute; inset: 0; }
 .pc .pc-fx { position: absolute; inset: 0; pointer-events: none; }
+.pc .pc-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: none; background: #000; }
+.pc.has-cam .pc-video { display: block; }
+.pc.has-cam .pc-avatar { display: none; }
+.cam-preview { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 14px; background: #000; transform: scaleX(-1); }
 .pc .pc-avatar {
   position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%);
   width: 44cqh; height: 44cqh; border-radius: 50%; display: grid; place-items: center; font-size: 27cqh; line-height: 1;

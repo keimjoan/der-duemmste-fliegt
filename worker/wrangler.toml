@@ -1,0 +1,8 @@
+name = "ddf-cam"
+main = "index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+ALLOWED_ORIGINS = "https://keimjoan.github.io"
+SFU_APP_ID = "HIER_APP_ID_EINTRAGEN"
+# SFU_SECRET wird nicht hier eingetragen, sondern mit: npx wrangler secret put SFU_SECRET

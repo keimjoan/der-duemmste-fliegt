@@ -45,6 +45,9 @@ const URL = process.env.URL || 'file://' + path.join(__dirname, '..', 'index.htm
       await page.screenshot({ path: path.join(OUT, '04-roulette.png') });
       await page.waitForTimeout(5000);
       await page.screenshot({ path: path.join(OUT, '05-after-joker.png') });
+      const jk = await page.evaluate(() => { const G = window.__ddf.engine.G, t = G.turns[G.t], n = G.turns[G.t + 1]; return { from: t.jokerFrom, next: n && n.pid, nextJoker: n && n.jokerFrom }; });
+      console.log('joker check', jk);
+      if (!jk.from || jk.next !== jk.from || jk.nextJoker) throw new Error('Nach der Joker-Frage ist nicht der Aktivator dran: ' + JSON.stringify(jk));
     }
     st = await G();
     if (st.t === 1) { await page.fill(`#given-${st.round}-${st.t}`, 'Mango'); await page.press(`#given-${st.round}-${st.t}`, 'Enter'); }

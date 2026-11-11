@@ -361,7 +361,11 @@ class Engine {
   }
   applyJoker(from, to) {
     const G = this.G, turn = this.cur(); G.roulette = null;
-    if (turn) { turn.jokerFrom = from; turn.pid = to; }
+    if (turn) {
+      turn.jokerFrom = from; turn.pid = to;
+      // Nach der Joker-Frage bekommt der Aktivator eine neue reguläre Frage, danach geht die Runde normal weiter.
+      G.turns.splice(G.t + 1, 0, { pid: from, q: null, result: null, given: '', jokerFrom: null });
+    }
     G.timer = this.mkTimer(this.s.answerTime);
     this.commit({ type: 'jokerTo', from, to });
   }
@@ -601,7 +605,7 @@ class Engine {
     return {
       v: 1, gid: G.gid, code: G.code, mode: G.mode, phase: G.phase, round: G.round, host: G.hostName,
       s: { lives: s.lives, qpp: s.qpp, joker: s.joker, jokerMode: s.jokerMode, onlyWrong: s.onlyWrong, finalQuestions: s.finalQuestions, heartBonus: s.heartBonus },
-      players: G.players.map(p => ({ id: p.id, name: p.name, avatar: p.avatar, color: p.color, hearts: p.hearts, joker: p.joker, out: p.out, outOrder: p.outOrder, conn: !!p.conn, device: !!p.device, dots: dots[p.id] || [] })),
+      players: G.players.map(p => ({ id: p.id, name: p.name, avatar: p.avatar, color: p.color, hearts: p.hearts, joker: p.joker, out: p.out, outOrder: p.outOrder, conn: !!p.conn, device: !!p.device, cam: p.cam || null, dots: dots[p.id] || [] })),
       turn: turn ? { i: G.t, n: G.turns.length, pid: turn.pid, q: turn.q.q, flag: turn.q.flag || null, result: turn.result, given: turn.result === 'wrong' ? turn.given : '', a: turn.result ? turn.q.a : null, jokerFrom: turn.jokerFrom, next: this.nextPid() } : null,
       roulette: G.roulette, jokerUsed: G.jokerUsed, timer: G.timer,
       review: (G.review && ['review', 'vote', 'tb', 'reveal'].includes(G.phase)) ? G.review : null,
@@ -998,6 +1002,108 @@ class ServerClientNet {
   }
   close() { try { this.es.close(); } catch (e) { /* egal */ } }
 }
+// --- Spielerkameras über Cloudflare Realtime SFU (Worker in worker/ verwahrt das App Secret) ---
+const CAM_API = '';
+const camOk = () => !!CAM_API && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && !!window.RTCPeerConnection;
+async function camApi(method, path, body) {
+  const res = await fetch(CAM_API + path, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok || d.errorCode) throw new Error(d.errorDescription || 'Kameradienst antwortet nicht (' + res.status + ')');
+  return d;
+}
+function camPc() { return new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], bundlePolicy: 'max-bundle' }); }
+function camIce(pc, ms = 2000) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(r => { const t = setTimeout(r, ms); pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') { clearTimeout(t); r(); } }); });
+}
+class CamSender {
+  constructor(onInfo) { this.onInfo = onInfo; this.on = false; }
+  async start() {
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
+    this.on = true;
+    await this.publish();
+  }
+  async publish() {
+    if (this.pc) this.pc.close();
+    const pc = camPc(); this.pc = pc;
+    const tr = pc.addTransceiver(this.stream.getVideoTracks()[0], { direction: 'sendonly', sendEncodings: [{ maxBitrate: 2500000, maxFramerate: 30 }] });
+    await pc.setLocalDescription(await pc.createOffer());
+    await camIce(pc);
+    const { sessionId } = await camApi('POST', '/sessions');
+    const r = await camApi('POST', `/sessions/${sessionId}/tracks`, { sessionDescription: { type: 'offer', sdp: pc.localDescription.sdp }, tracks: [{ location: 'local', mid: tr.mid, trackName: 'cam' }] });
+    if (r.tracks && r.tracks[0] && r.tracks[0].errorCode) throw new Error(r.tracks[0].errorDescription);
+    await pc.setRemoteDescription(r.sessionDescription);
+    pc.onconnectionstatechange = () => { if (this.pc === pc && pc.connectionState === 'failed') this.retry(); };
+    this.info = { sid: sessionId, track: 'cam' };
+    this.onInfo(this.info);
+  }
+  retry() {
+    if (!this.on) return; clearTimeout(this.rt);
+    this.rt = setTimeout(() => { this.publish().catch(() => this.retry()); }, 3000);
+  }
+  stop() {
+    this.on = false; this.info = null; clearTimeout(this.rt);
+    if (this.pc) this.pc.close(); this.pc = null;
+    if (this.stream) this.stream.getTracks().forEach(t => t.stop()); this.stream = null;
+  }
+}
+class CamViewer {
+  constructor(onChange) { this.onChange = onChange; this.subs = new Map(); this.wanted = new Map(); this.q = Promise.resolve(); this.closed = false; }
+  sync(players) {
+    const w = new Map();
+    players.forEach(p => { if (p.cam && !p.out) w.set(p.id, p.cam.sid + '/' + p.cam.track); });
+    this.wanted = w;
+    let changed = false;
+    for (const [pid, s] of this.subs) if (w.get(pid) !== s.key) { this.subs.delete(pid); changed = true; }
+    for (const [pid, key] of w) if (!this.subs.has(pid)) { const s = { key, stream: null, mid: null }; this.subs.set(pid, s); this.q = this.q.then(() => this.subscribe(pid, s)); }
+    if (changed) this.onChange();
+  }
+  async session() {
+    if (this.pc) return;
+    const pc = camPc(); this.pc = pc;
+    pc.ontrack = e => this.gotTrack(e);
+    pc.onconnectionstatechange = () => { if (this.pc === pc && pc.connectionState === 'failed') this.reset(); };
+    this.sid = (await camApi('POST', '/sessions')).sessionId;
+  }
+  gotTrack(e) {
+    const mid = e.transceiver.mid;
+    for (const s of this.subs.values()) if (s.mid === mid) {
+      s.stream = new MediaStream([e.track]);
+      e.track.onmute = e.track.onunmute = e.track.onended = () => this.onChange();
+      this.onChange();
+    }
+  }
+  async subscribe(pid, s) {
+    const [sid, track] = s.key.split('/');
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (this.closed || this.subs.get(pid) !== s) return;
+      try {
+        await this.session();
+        const r = await camApi('POST', `/sessions/${this.sid}/tracks`, { tracks: [{ location: 'remote', sessionId: sid, trackName: track }] });
+        const t = r.tracks && r.tracks[0];
+        if (!t || t.errorCode || !r.sessionDescription) throw new Error((t && t.errorDescription) || 'Kamera nicht verfügbar');
+        s.mid = t.mid;
+        await this.pc.setRemoteDescription(r.sessionDescription);
+        await this.pc.setLocalDescription(await this.pc.createAnswer());
+        await camIce(this.pc);
+        await camApi('PUT', `/sessions/${this.sid}/renegotiate`, { sessionDescription: { type: 'answer', sdp: this.pc.localDescription.sdp } });
+        return;
+      } catch (e) { console.warn('Kamera', e.message); await new Promise(r => setTimeout(r, 2000)); }
+    }
+  }
+  reset() {
+    try { this.pc.close(); } catch (e) { /* egal */ }
+    this.pc = null; this.subs.clear(); this.onChange();
+    setTimeout(() => { if (this.closed) return; const w = this.wanted; for (const [pid, key] of w) if (!this.subs.has(pid)) { const s = { key, stream: null, mid: null }; this.subs.set(pid, s); this.q = this.q.then(() => this.subscribe(pid, s)); } }, 2000);
+  }
+  stream(pid) {
+    const s = this.subs.get(pid); if (!s || !s.stream) return null;
+    const t = s.stream.getVideoTracks()[0];
+    return t && t.readyState === 'live' && !t.muted ? s.stream : null;
+  }
+  close() { this.closed = true; try { this.pc && this.pc.close(); } catch (e) { /* egal */ } }
+}
+
 function netErrorText(err) {
   if (!err) return 'Verbindung fehlgeschlagen.';
   const t = err.type || '';
@@ -1065,7 +1171,7 @@ class HostCtl {
     }
     this.netStatus = 'error'; this.netErr = { message: 'Kein freier Spielcode gefunden.' }; this.e.commit(); return false;
   }
-  goOffline() { if (this.net) this.net.close(); this.net = null; this.conns.clear(); this.netStatus = 'off'; this.e.G.players.forEach(p => { p.conn = false; }); this.e.G.mode = 'local'; this.e.commit(); }
+  goOffline() { if (this.net) this.net.close(); this.net = null; this.conns.clear(); this.netStatus = 'off'; this.e.G.players.forEach(p => { p.conn = false; p.cam = null; }); this.e.G.mode = 'local'; this.e.commit(); }
   onMsg(cid, m) {
     if (!m || typeof m !== 'object') return;
     let c = this.conns.get(cid); if (!c) { c = { pid: null, last: Date.now() }; this.conns.set(cid, c); }
@@ -1077,6 +1183,12 @@ class HostCtl {
       case 'joker': if (c.pid) e.useJoker(c.pid, m.target); return;
       case 'vote': if (c.pid) e.castVote(c.pid, m.target); return;
       case 'final': if (c.pid) e.finalInput(c.pid, m.text, m.lock); return;
+      case 'cam': {
+        const p = c.pid ? e.player(c.pid) : null; if (!p) return;
+        const ok = m.cam && /^[\w-]{1,128}$/.test(m.cam.sid) && /^[\w-]{1,64}$/.test(m.cam.track);
+        p.cam = ok ? { sid: m.cam.sid, track: m.cam.track } : null; e.commit();
+        return;
+      }
       case 'bye': return this.drop(cid);
       default: return;
     }
@@ -1099,7 +1211,7 @@ class HostCtl {
     const c = this.conns.get(cid); this.conns.delete(cid);
     if (c && c.pid) {
       const p = this.e.player(c.pid);
-      if (p && !Array.from(this.conns.values()).some(o => o.pid === p.id)) { p.conn = false; this.e.commit(); }
+      if (p && !Array.from(this.conns.values()).some(o => o.pid === p.id)) { p.conn = false; p.cam = null; this.e.commit(); }
     }
   }
   isConnected(pid) { return Array.from(this.conns.values()).some(c => c.pid === pid); }
@@ -1139,6 +1251,7 @@ class PlayerCtl {
     if (m.t === 'welcome') {
       this.profile.pid = m.pid || null; this.spectator = !!m.spectator; this.reason = m.reason;
       store.set('ddf-player', Object.assign({}, this.profile, { code: this.code }));
+      if (this.cam && this.cam.info) this.send({ t: 'cam', cam: this.cam.info });
     } else if (m.t === 'state') {
       const off = m.s.now - Date.now(); this.offset = this.S ? this.offset * 0.7 + off * 0.3 : off;
       this.S = m.s; this.me = m.me; this.spectator = !!m.spectator;
@@ -1146,7 +1259,24 @@ class PlayerCtl {
     this.emit();
   }
   send(m) { return this.net ? this.net.send(m) : false; }
-  close() { clearInterval(this.pingI); clearInterval(this.watchI); if (this.net) { try { this.net.send({ t: 'bye' }); } catch (e) { /* egal */ } this.net.close(); } this.net = null; }
+  async camToggle() {
+    if (this.camBusy) return;
+    if (this.cam) { this.camStop(); this.send({ t: 'cam', cam: null }); this.emit(); return; }
+    this.camBusy = true; this.emit();
+    const cam = new CamSender(info => this.send({ t: 'cam', cam: info }));
+    try {
+      await cam.start();
+      this.cam = cam;
+      this.camEl = h('video', { class: 'cam-preview', autoplay: true, playsinline: true });
+      this.camEl.muted = true; this.camEl.setAttribute('playsinline', ''); this.camEl.srcObject = cam.stream;
+    } catch (e) {
+      cam.stop();
+      toast(e && e.name === 'NotAllowedError' ? 'Kamera wurde nicht freigegeben.' : e && e.name === 'NotFoundError' ? 'Keine Kamera gefunden.' : 'Kamera konnte nicht starten.');
+    }
+    this.camBusy = false; this.emit();
+  }
+  camStop() { if (this.cam) this.cam.stop(); this.cam = null; this.camEl = null; }
+  close() { this.camStop(); clearInterval(this.pingI); clearInterval(this.watchI); if (this.net) { try { this.net.send({ t: 'bye' }); } catch (e) { /* egal */ } this.net.close(); } this.net = null; }
 }
 
 // =========================================================================
@@ -1201,6 +1331,7 @@ class StageView {
     this.main = h('div', { class: 'st-main' }, this.grid, this.side);
     this.bottom = h('div', { class: 'st-bottom' });
     this.ov = h('div', { class: 'st-ov' });
+    if (this.opts.cams && camOk()) this.camv = new CamViewer(() => { if (this.S) this.update(this.S, this.offset); });
     this.stage.append(this.canvas, this.top, this.main, this.bottom, this.ov);
     this.wrap.append(this.stage); root.append(this.wrap);
     this.cards = new Map(); this.S = null; this.offset = 0; this.lastFx = null; this.sig = {};
@@ -1210,7 +1341,7 @@ class StageView {
     this.raf = requestAnimationFrame(this.loopFn);
   }
   fit() { const r = this.wrap.getBoundingClientRect(); const s = Math.min(r.width / 1920, r.height / 1080); if (s > 0) this.stage.style.setProperty('--scale', s); }
-  destroy() { cancelAnimationFrame(this.raf); this.ro.disconnect(); this.stars.stop(); this.root.textContent = ''; }
+  destroy() { cancelAnimationFrame(this.raf); this.ro.disconnect(); this.stars.stop(); if (this.camv) this.camv.close(); this.root.textContent = ''; }
   now() { return Date.now() + this.offset; }
   snd(n) { if (this.opts.sound) Sfx.play(n); }
   setSig(key, sig, fn) { if (this.sig[key] === sig) return; this.sig[key] = sig; fn(); }
@@ -1219,6 +1350,7 @@ class StageView {
   update(S, offset) {
     if (!S) return;
     this.offset = offset || 0; this.S = S;
+    if (this.camv) this.camv.sync(S.players);
     const ph = S.phase, fmode = ['finalIntro', 'final', 'end'].includes(ph), withSide = ['review', 'vote', 'tb', 'reveal'].includes(ph);
     this.stage.classList.toggle('final-mode', fmode);
     this.stage.classList.toggle('ph-cover', ph === 'finalIntro' || ph === 'end');
@@ -1272,8 +1404,10 @@ class StageView {
     this.grid.style.width = (cols * w + (cols - 1) * gap + 2) + 'px';
   }
   makeCard() {
+    const video = h('video', { class: 'pc-video', autoplay: true, playsinline: true });
+    video.muted = true; video.setAttribute('playsinline', '');
     const P = {
-      dots: h('div', { class: 'pc-dots' }), joker: h('div', { class: 'pc-joker', title: 'Joker' }, 'J'),
+      video, dots: h('div', { class: 'pc-dots' }), joker: h('div', { class: 'pc-joker', title: 'Joker' }, 'J'),
       hearts: h('div', { class: 'pc-hearts' }), avatar: h('div', { class: 'pc-avatar' }), name: h('div', { class: 'pc-name' }),
       tag: h('div', { class: 'pc-tag hidden' }), badge: h('div', { class: 'pc-badge hidden' }), check: h('div', { class: 'pc-check hidden' }, '✓'),
       out: h('div', { class: 'pc-out' }, h('span', null, 'RAUS')), offline: h('div', { class: 'pc-offline hidden' }, 'offline'),
@@ -1292,6 +1426,11 @@ class StageView {
     const set = (k, sig, fn) => { if (st[k] !== sig) { st[k] = sig; fn(); } };
     set('color', p.color, () => el.style.setProperty('--pc', p.color));
     set('avatar', p.avatar, () => { P.avatar.textContent = p.avatar; });
+    const cam = this.camv ? this.camv.stream(p.id) : null;
+    set('cam', cam ? cam.id : '', () => {
+      P.video.srcObject = cam; el.classList.toggle('has-cam', !!cam);
+      if (cam) P.video.play().catch(() => { /* Autoplay blockiert */ });
+    });
     set('name', p.name, () => { P.name.textContent = p.name.toUpperCase(); });
     // Herzen (inkl. zerbrechendem Herz direkt nach Verlust)
     const fx = S.fx, brk = fx && (fx.type === 'heart' || fx.type === 'out') && fx.pid === p.id && now - fx.at < 1700;
@@ -1619,7 +1758,7 @@ function rulesNodes() {
     h('ul', null,
       h('li', null, 'Jeder startet mit 3 Herzen und einem Joker.'),
       h('li', null, 'Pro Runde bekommt jeder reihum 2 Fragen. Für jede Antwort gibt es 30 Sekunden – irgendwas muss man sagen.'),
-      h('li', null, 'Joker: Einmal pro Spiel kannst du deine Frage abgeben. Das Joker-Roulette lost aus, wer sie stattdessen beantworten muss. Pro Runde darf nur ein Joker eingesetzt werden.'),
+      h('li', null, 'Joker: Einmal pro Spiel kannst du deine Frage abgeben. Das Joker-Roulette lost aus, wer sie stattdessen beantworten muss. Danach bekommst du eine neue Frage und die Runde geht bei dir weiter. Pro Runde darf nur ein Joker eingesetzt werden.'),
       h('li', null, 'Nach der Runde wird geheim abgestimmt: Wer hat die dümmste Antwort gegeben? Es geht nicht um die meisten Fehler, sondern um die dümmste Antwort. Wählbar ist nur, wer etwas falsch hatte.'),
       h('li', null, 'Wer die meisten Stimmen bekommt, verliert ein Herz. Bei Gleichstand gibt es eine Stichwahl, eine Entscheidung des Moderators oder den Zufall.'),
       h('li', null, 'Ohne Herzen fliegt man raus.'),
@@ -2022,9 +2161,10 @@ class PlayerPanel {
     if (c.spectator || !mine) out.push(h('div', { class: 'card small' }, c.reason || 'Du schaust zu.'));
     else out.push(h('div', { class: 'card me-card', style: `--pc:${mine.color}` }, h('span', { class: 'avatar-dot' }, mine.avatar), h('div', { class: 'grow' }, h('div', { class: 'nm' }, mine.name), h('div', { html: heartsInline(mine.hearts, S.s.lives) })), S.s.joker ? h('span', { class: 'pill ' + (mine.joker ? 'warn' : '') }, mine.joker ? 'Joker bereit' : 'Joker weg') : null));
     if (mine && mine.out && S.phase !== 'end') out.push(h('div', { class: 'card', style: 'border-color:rgba(255,77,94,.5)' }, h('b', null, 'Du bist raus.'), h('div', { class: 'small muted' }, 'Schau weiter zu – vielleicht fliegt gleich der Nächste.')));
+    if (c.camEl && mine) { out.push(c.camEl); c.camEl.play().catch(() => { /* Autoplay blockiert */ }); }
     out.push(this.phaseCard(S, me, mine));
     out.push(this.roster(S, me));
-    out.push(h('div', { class: 'row' }, h('button', { class: 'btn small ghost', onclick: showRules }, 'Regeln'), h('button', { class: 'btn small ghost', onclick: () => { Sfx.on = !Sfx.on; store.set('ddf-sound', Sfx.on); App.syncSound(); this.render(true); } }, Sfx.on ? 'Ton an' : 'Ton aus'), h('button', { class: 'btn small ghost', onclick: () => confirmModal('Spiel verlassen?', 'Du kannst später mit demselben Namen wieder beitreten.', 'Verlassen', () => App.home()) }, 'Verlassen')));
+    out.push(h('div', { class: 'row' }, camOk() && mine ? h('button', { class: 'btn small ' + (c.cam ? 'gold' : 'ghost'), disabled: !!c.camBusy, onclick: () => c.camToggle() }, c.camBusy ? 'Kamera startet …' : c.cam ? 'Kamera aus' : 'Kamera an') : null, h('button', { class: 'btn small ghost', onclick: showRules }, 'Regeln'), h('button', { class: 'btn small ghost', onclick: () => { Sfx.on = !Sfx.on; store.set('ddf-sound', Sfx.on); App.syncSound(); this.render(true); } }, Sfx.on ? 'Ton an' : 'Ton aus'), h('button', { class: 'btn small ghost', onclick: () => confirmModal('Spiel verlassen?', 'Du kannst später mit demselben Namen wieder beitreten.', 'Verlassen', () => App.home()) }, 'Verlassen')));
     return out;
   }
   phaseCard(S, me, mine) {
@@ -2156,7 +2296,7 @@ const App = {
       h('div', { class: 'rules-mini' }, h('b', null, 'Kurz erklärt'), h('ul', null,
         h('li', null, '3 Herzen, pro Runde 2 Fragen für jeden, 30 Sekunden Zeit.'),
         h('li', null, 'Nach jeder Runde geheimes Voting: Die dümmste Antwort kostet ein Herz.'),
-        h('li', null, 'Joker gibt deine Frage per Roulette an jemand anderen weiter.'),
+        h('li', null, 'Joker gibt deine Frage per Roulette an jemand anderen weiter – danach bekommst du eine neue Frage.'),
         h('li', null, 'Die letzten zwei spielen das Finale – übrige Herzen zählen als Punkte.')),
         h('button', { class: 'btn small ghost', style: 'margin-top:8px', onclick: showRules }, 'Alle Regeln')));
     this.root.appendChild(h('div', { class: 'home' }, bg, h('div', { class: 'front' }, card)));
@@ -2177,13 +2317,13 @@ const App = {
   startHost(mode, G) {
     this.clear();
     const engine = new Engine(G ? JSON.parse(JSON.stringify(G)) : Engine.fresh(mode || 'local'));
-    if (G) { engine.G.players.forEach(p => { p.conn = false; }); }
+    if (G) { engine.G.players.forEach(p => { p.conn = false; p.cam = null; }); }
     const ctl = new HostCtl(engine); this.host = ctl;
     const stageArea = h('div', { class: 'stage-area' });
     const panelEl = h('div', { class: 'panel', id: 'host-panel' });
     const shell = h('div', { class: 'host' }, stageArea, panelEl);
     this.root.appendChild(shell);
-    const stage = new StageView(stageArea, { sound: Sfx.on });
+    const stage = new StageView(stageArea, { sound: Sfx.on, cams: true });
     stageArea.appendChild(h('button', { class: 'btn small stage-only-hint', onclick: () => this.toggleStageOnly() }, 'Pult zeigen (B)'));
     const panel = new HostPanel(panelEl, ctl);
     this.hostView = { stage, panel, shell };
@@ -2257,7 +2397,7 @@ const App = {
     this.clear();
     const area = h('div', { class: 'stage-area', style: 'position:fixed;inset:0' });
     this.root.appendChild(area);
-    const stage = new StageView(area, { sound: false });
+    const stage = new StageView(area, { sound: false, cams: true });
     const wait = h('div', { class: 'toast', style: 'bottom:auto;top:16px' }, 'Warte auf den Moderator-Tab in diesem Browser …');
     document.body.appendChild(wait);
     const snd = h('button', { class: 'btn small', style: 'position:fixed;right:12px;bottom:12px;z-index:5;opacity:.6' }, 'Ton aus');
